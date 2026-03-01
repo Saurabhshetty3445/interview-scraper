@@ -1,7 +1,5 @@
 """
 main.py - FastAPI app for Railway deployment
-Exposes health check + manual trigger endpoints
-Runs the scheduler in a background thread
 """
 import threading
 import os
@@ -19,17 +17,20 @@ from database.db import get_client
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start scheduler in background thread when app starts."""
+    """Start scheduler AFTER server is ready — never block startup."""
     log.info("Interview Scraper API starting...")
-    scheduler_thread = threading.Thread(
-        target=start_scheduler,
-        kwargs={"run_immediately": True},
-        daemon=True
-    )
+
+    # Delay scheduler start by 10s so health check passes first
+    def delayed_start():
+        import time
+        time.sleep(10)
+        start_scheduler(run_immediately=True)
+
+    scheduler_thread = threading.Thread(target=delayed_start, daemon=True)
     scheduler_thread.start()
-    log.info("Scheduler started in background")
+    log.info("Scheduler will start in 10 seconds...")
     yield
-    log.info("Interview Scraper API shutting down")
+    log.info("Shutting down...")
 
 
 app = FastAPI(
@@ -53,13 +54,21 @@ async def root():
         "status": "online",
         "service": "Interview Scraper",
         "version": "1.0.0",
-        "endpoints": ["/health", "/trigger/all", "/trigger/reddit", "/trigger/leetcode", "/stats"],
     }
 
 
 @app.get("/health")
 async def health():
-    """Railway health check endpoint."""
+    """
+    Railway health check — must respond fast with 200.
+    Does NOT check DB so startup is never blocked.
+    """
+    return {"status": "healthy"}
+
+
+@app.get("/health/db")
+async def health_db():
+    """Deep health check including DB — call manually to verify DB connection."""
     try:
         db = get_client()
         db.table("companies").select("id").limit(1).execute()
@@ -70,7 +79,6 @@ async def health():
 
 @app.post("/trigger/all")
 async def trigger_all(background_tasks: BackgroundTasks):
-    """Manually trigger all scrapers."""
     background_tasks.add_task(run_all_scrapers)
     return {"status": "triggered", "message": "All scrapers started in background"}
 
@@ -89,36 +97,21 @@ async def trigger_leetcode(background_tasks: BackgroundTasks):
 
 @app.get("/stats")
 async def get_stats():
-    """Return high-level stats from the database."""
     try:
         db = get_client()
-
         companies_res = db.table("companies").select("id", count="exact").execute()
-        posts_res = db.table("posts").select("id", count="exact").execute()
+        posts_res     = db.table("posts").select("id", count="exact").execute()
         questions_res = db.table("questions").select("id", count="exact").execute()
-
-        # Top companies
-        top_companies = db.table("companies")\
-            .select("name, post_count")\
-            .order("post_count", desc=True)\
-            .limit(10)\
-            .execute()
-
-        # Recent scraper logs
-        recent_logs = db.table("scraper_logs")\
-            .select("source, started_at, posts_inserted, status")\
-            .order("started_at", desc=True)\
-            .limit(5)\
-            .execute()
-
+        top_companies = db.table("companies").select("name, post_count").order("post_count", desc=True).limit(10).execute()
+        recent_logs   = db.table("scraper_logs").select("source, started_at, posts_inserted, status").order("started_at", desc=True).limit(5).execute()
         return {
             "totals": {
                 "companies": companies_res.count,
-                "posts": posts_res.count,
+                "posts":     posts_res.count,
                 "questions": questions_res.count,
             },
             "top_companies": top_companies.data,
-            "recent_runs": recent_logs.data,
+            "recent_runs":   recent_logs.data,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -127,4 +120,5 @@ async def get_stats():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
+    log.info(f"Starting server on 0.0.0.0:{port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
