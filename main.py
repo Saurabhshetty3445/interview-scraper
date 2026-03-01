@@ -3,41 +3,18 @@ main.py - FastAPI app for Railway deployment
 """
 import threading
 import os
+import time
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from utils.logger import log
-from jobs.scheduler import start_scheduler, run_all_scrapers
-from scrapers.reddit_scraper import run_reddit_scraper
-from scrapers.leetcode_scraper import run_leetcode_scraper
-from database.db import get_client
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Start scheduler AFTER server is ready — never block startup."""
-    log.info("Interview Scraper API starting...")
-
-    # Delay scheduler start by 10s so health check passes first
-    def delayed_start():
-        import time
-        time.sleep(10)
-        start_scheduler(run_immediately=True)
-
-    scheduler_thread = threading.Thread(target=delayed_start, daemon=True)
-    scheduler_thread.start()
-    log.info("Scheduler will start in 10 seconds...")
-    yield
-    log.info("Shutting down...")
-
-
+# ── App must be created BEFORE importing heavy modules ────────────────────────
 app = FastAPI(
     title="Interview Scraper API",
-    description="Scrapes LeetCode & Reddit for interview experiences",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -48,77 +25,100 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "Interview Scraper",
-        "version": "1.0.0",
-    }
-
-
+# ── Health check — must be fast, no DB, no imports ───────────────────────────
 @app.get("/health")
 async def health():
-    """
-    Railway health check — must respond fast with 200.
-    Does NOT check DB so startup is never blocked.
-    """
     return {"status": "healthy"}
 
 
-@app.get("/health/db")
-async def health_db():
-    """Deep health check including DB — call manually to verify DB connection."""
+@app.get("/")
+async def root():
+    return {"status": "online", "service": "Interview Scraper", "version": "1.0.0"}
+
+
+# ── Lazy imports — only loaded after server is healthy ───────────────────────
+def _load_and_start_scheduler():
+    """Import heavy deps and start scheduler AFTER server is already up."""
+    time.sleep(15)  # Give Railway health check time to pass first
     try:
-        db = get_client()
-        db.table("companies").select("id").limit(1).execute()
-        return {"status": "healthy", "database": "connected"}
+        from utils.logger import log
+        from jobs.scheduler import start_scheduler
+        log.info("Starting scheduler...")
+        start_scheduler(run_immediately=True)
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {e}")
+        print(f"Scheduler error: {e}")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Fire and forget — start scheduler in background thread."""
+    t = threading.Thread(target=_load_and_start_scheduler, daemon=True)
+    t.start()
+
+
+# ── Trigger endpoints ─────────────────────────────────────────────────────────
 @app.post("/trigger/all")
 async def trigger_all(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_all_scrapers)
-    return {"status": "triggered", "message": "All scrapers started in background"}
+    from scrapers.reddit_scraper import run_reddit_scraper
+    from scrapers.leetcode_scraper import run_leetcode_scraper
+    def run_both():
+        run_leetcode_scraper()
+        run_reddit_scraper()
+    background_tasks.add_task(run_both)
+    return {"status": "triggered"}
 
 
 @app.post("/trigger/reddit")
 async def trigger_reddit(background_tasks: BackgroundTasks):
+    from scrapers.reddit_scraper import run_reddit_scraper
     background_tasks.add_task(run_reddit_scraper)
-    return {"status": "triggered", "message": "Reddit scraper started"}
+    return {"status": "triggered", "source": "reddit"}
 
 
 @app.post("/trigger/leetcode")
 async def trigger_leetcode(background_tasks: BackgroundTasks):
+    from scrapers.leetcode_scraper import run_leetcode_scraper
     background_tasks.add_task(run_leetcode_scraper)
-    return {"status": "triggered", "message": "LeetCode scraper started"}
+    return {"status": "triggered", "source": "leetcode"}
+
+
+@app.get("/health/db")
+async def health_db():
+    try:
+        from database.db import get_client
+        db = get_client()
+        db.table("companies").select("id").limit(1).execute()
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.get("/stats")
 async def get_stats():
     try:
+        from database.db import get_client
         db = get_client()
-        companies_res = db.table("companies").select("id", count="exact").execute()
-        posts_res     = db.table("posts").select("id", count="exact").execute()
-        questions_res = db.table("questions").select("id", count="exact").execute()
-        top_companies = db.table("companies").select("name, post_count").order("post_count", desc=True).limit(10).execute()
-        recent_logs   = db.table("scraper_logs").select("source, started_at, posts_inserted, status").order("started_at", desc=True).limit(5).execute()
+        companies = db.table("companies").select("id", count="exact").execute()
+        posts     = db.table("posts").select("id", count="exact").execute()
+        questions = db.table("questions").select("id", count="exact").execute()
+        top       = db.table("companies").select("name, post_count").order("post_count", desc=True).limit(10).execute()
+        logs      = db.table("scraper_logs").select("source, started_at, posts_inserted, status").order("started_at", desc=True).limit(5).execute()
         return {
-            "totals": {
-                "companies": companies_res.count,
-                "posts":     posts_res.count,
-                "questions": questions_res.count,
-            },
-            "top_companies": top_companies.data,
-            "recent_runs":   recent_logs.data,
+            "totals": {"companies": companies.count, "posts": posts.count, "questions": questions.count},
+            "top_companies": top.data,
+            "recent_runs": logs.data,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    log.info(f"Starting server on 0.0.0.0:{port}")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on 0.0.0.0:{port}")
+    uvicorn.run(
+        app,                   # Pass app object directly, not string
+        host="0.0.0.0",        # MUST be 0.0.0.0 — not localhost or 127.0.0.1
+        port=port,
+        log_level="info",
+    )
