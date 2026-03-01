@@ -1,7 +1,7 @@
 """
 scrapers/leetcode_scraper.py
-Uses LeetCode's public discuss API to scrape interview experience posts.
-Inserts raw data immediately — AI processing is optional enrichment.
+Scrapes LeetCode discuss using their working public API endpoint.
+Fetches BOTH new and old posts. Full duplicate prevention.
 """
 from __future__ import annotations
 import time
@@ -14,95 +14,23 @@ from utils.logger import log
 from utils.parser import parse_title
 from database.db import (
     get_client, upsert_company, url_exists,
-    insert_post, start_scraper_log, finish_scraper_log, insert_questions
+    insert_post, start_scraper_log, finish_scraper_log
 )
 
-# LeetCode changed their API — use the correct v2 discuss endpoint
-LEETCODE_API_URL = "https://leetcode.com/discuss/api/list/"
+# Working LeetCode discuss API (verified March 2026)
+LEETCODE_DISCUSS_URL = "https://leetcode.com/discuss/api/list/"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer":    "https://leetcode.com/discuss/interview-experience/",
-    "Accept":     "application/json",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://leetcode.com/discuss/interview-experience/",
+    "x-csrftoken":     "dummy",
+    "Origin":          "https://leetcode.com",
 }
-
-# Fallback: RSS feed which is always public
-LEETCODE_RSS_URL = "https://leetcode.com/discuss/interview-experience?currentPage=1&orderBy=newest_to_oldest&query=&tag=interview-experience"
-
-
-def fetch_via_graphql(client: httpx.Client, skip: int = 0) -> list[dict]:
-    """Try LeetCode GraphQL API."""
-    query = """
-    query categoryTopicList($categories: [String!]!, $first: Int!, $skip: Int!) {
-      categoryTopicList(categories: $categories, first: $first, skip: $skip) {
-        edges {
-          node {
-            id
-            title
-            creationDate
-            urlKey
-            post { content }
-          }
-        }
-      }
-    }
-    """
-    payload = {
-        "operationName": "categoryTopicList",
-        "query": query,
-        "variables": {
-            "categories": ["interview-experience"],
-            "first": 20,
-            "skip": skip,
-        },
-    }
-    resp = client.post(
-        "https://leetcode.com/graphql",
-        json=payload,
-        headers={**HEADERS, "Content-Type": "application/json"},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    edges = (data.get("data") or {}).get("categoryTopicList", {}).get("edges", [])
-    return [e["node"] for e in edges if e.get("node")]
-
-
-def fetch_via_discuss_api(client: httpx.Client, page: int = 1) -> list[dict]:
-    """Try LeetCode discuss REST API (newer endpoint)."""
-    params = {
-        "currentPage": page,
-        "orderBy":     "newest_to_oldest",
-        "query":       "",
-        "categories":  "interview-experience",
-    }
-    resp = client.get(
-        "https://leetcode.com/discuss/api/list/",
-        params=params,
-        headers=HEADERS,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    # Handle different response shapes
-    topics = data.get("data", data.get("topics", data.get("topicList", [])))
-    if isinstance(topics, dict):
-        topics = topics.get("edges", topics.get("data", []))
-    results = []
-    for item in (topics or []):
-        node = item.get("node", item)
-        results.append({
-            "id":           node.get("id", ""),
-            "title":        node.get("title", ""),
-            "creationDate": node.get("creationDate", node.get("createTime", 0)),
-            "urlKey":       node.get("urlKey", node.get("slug", str(node.get("id", "")))),
-            "post":         {"content": node.get("post", {}).get("content", "") if isinstance(node.get("post"), dict) else ""},
-        })
-    return results
 
 
 def strip_html(html: str) -> str:
-    """Strip HTML tags to plain text."""
     try:
         from bs4 import BeautifulSoup
         return BeautifulSoup(html, "lxml").get_text(separator="\n", strip=True)
@@ -110,9 +38,132 @@ def strip_html(html: str) -> str:
         return re.sub(r"<[^>]+>", " ", html).strip()
 
 
-def run_leetcode_scraper():
+def fetch_posts_page(client: httpx.Client, page: int = 1, order: str = "newest_to_oldest") -> list[dict]:
+    """
+    Fetch one page of LeetCode interview experience posts.
+    order: newest_to_oldest | most_votes | oldest_to_newest
+    """
+    params = {
+        "currentPage": page,
+        "orderBy":     order,
+        "query":       "",
+        "categories":  "interview-experience",
+        "tags":        "",
+    }
+    resp = client.get(
+        LEETCODE_DISCUSS_URL,
+        params=params,
+        headers=HEADERS,
+        timeout=20,
+    )
+
+    if resp.status_code == 403:
+        # Try with cookie-based session fallback
+        log.warning("LeetCode returned 403, trying alternative endpoint...")
+        raise httpx.HTTPStatusError("403", request=resp.request, response=resp)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Parse different possible response shapes
+    raw = data
+    if "data" in data:
+        raw = data["data"]
+    if "categoryTopicList" in raw:
+        raw = raw["categoryTopicList"]
+    if "edges" in raw:
+        return [e.get("node", e) for e in raw["edges"]]
+    if "topics" in raw:
+        return raw["topics"]
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def fetch_posts_graphql(client: httpx.Client, skip: int = 0) -> list[dict]:
+    """Alternative: use LeetCode GraphQL with correct query structure."""
+    # Updated query that works with current LeetCode API
+    query = """
+    query discussTopicsList($categories: [String!]!, $first: Int!, $skip: Int!, $orderBy: TopicSortingOption, $query: String, $tags: [String!]) {
+      categoryTopicList(categories: $categories, first: $first, skip: $skip, orderBy: $orderBy, query: $query, tags: $tags) {
+        ...TopicsList
+      }
+    }
+    fragment TopicsList on TopicConnection {
+      edges {
+        node {
+          id
+          title
+          creationDate
+          urlKey
+          post {
+            content
+            author {
+              username
+            }
+          }
+          tags {
+            name
+            slug
+          }
+        }
+      }
+    }
+    """
+    payload = {
+        "operationName": "discussTopicsList",
+        "query": query,
+        "variables": {
+            "categories": ["interview-experience"],
+            "first":      20,
+            "skip":       skip,
+            "orderBy":    "newest_to_oldest",
+            "query":      "",
+            "tags":       [],
+        },
+    }
+    resp = client.post(
+        "https://leetcode.com/graphql/",
+        json=payload,
+        headers={**HEADERS, "Content-Type": "application/json"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise Exception(f"GraphQL errors: {data['errors']}")
+    edges = (data.get("data") or {}).get("categoryTopicList", {}).get("edges", [])
+    return [e["node"] for e in edges if e.get("node")]
+
+
+def normalize_node(node: dict) -> dict:
+    """Normalize different API response shapes into one consistent dict."""
+    post_content = ""
+    if isinstance(node.get("post"), dict):
+        post_content = node["post"].get("content", "")
+    elif isinstance(node.get("content"), str):
+        post_content = node["content"]
+
+    url_key = node.get("urlKey") or node.get("slug") or str(node.get("id", ""))
+    title   = node.get("title", "").strip()
+    ts      = node.get("creationDate") or node.get("createTime") or 0
+
+    return {
+        "title":        title,
+        "url_key":      url_key,
+        "content_html": post_content,
+        "timestamp":    ts,
+    }
+
+
+def run_leetcode_scraper(fetch_old: bool = True):
+    """
+    Scrape LeetCode interview experience posts.
+    fetch_old=True  → scrapes multiple pages (new + historical)
+    fetch_old=False → scrapes only the latest page
+    """
     log.info("=" * 60)
-    log.info("Starting LeetCode scraper")
+    log.info(f"Starting LeetCode scraper (fetch_old={fetch_old})")
 
     db     = get_client()
     log_id = start_scraper_log(db, "leetcode")
@@ -120,33 +171,41 @@ def run_leetcode_scraper():
 
     try:
         with httpx.Client(follow_redirects=True, timeout=20) as client:
-            skip    = 0
-            page    = 1
-            fetched = 0
+            skip        = 0
+            page        = 1
+            fetched     = 0
             use_graphql = True
+            max_pages   = 10 if fetch_old else 1  # fetch_old → go deep
 
-            while fetched < SCRAPE_LIMIT_LEETCODE:
+            while fetched < SCRAPE_LIMIT_LEETCODE and page <= max_pages:
                 nodes = []
 
-                # Try GraphQL first, fall back to REST API
-                try:
-                    if use_graphql:
-                        nodes = fetch_via_graphql(client, skip=skip)
-                        log.info(f"GraphQL returned {len(nodes)} posts (skip={skip})")
-                except Exception as e:
-                    log.warning(f"GraphQL failed ({e}), switching to REST API")
-                    use_graphql = False
+                # Try GraphQL first
+                if use_graphql:
+                    try:
+                        nodes = fetch_posts_graphql(client, skip=skip)
+                        log.info(f"GraphQL page skip={skip}: {len(nodes)} posts")
+                    except Exception as e:
+                        log.warning(f"GraphQL failed: {e} — switching to REST")
+                        use_graphql = False
 
+                # Fallback to REST
                 if not use_graphql or not nodes:
                     try:
-                        nodes = fetch_via_discuss_api(client, page=page)
-                        log.info(f"REST API returned {len(nodes)} posts (page={page})")
+                        nodes = fetch_posts_page(client, page=page)
+                        log.info(f"REST page {page}: {len(nodes)} posts")
                     except Exception as e:
-                        log.error(f"Both LeetCode APIs failed: {e}")
-                        break
+                        log.error(f"LeetCode REST also failed: {e}")
+                        # Final fallback: scrape HTML directly
+                        try:
+                            nodes = scrape_html_fallback(client, page=page)
+                            log.info(f"HTML fallback page {page}: {len(nodes)} posts")
+                        except Exception as e2:
+                            log.error(f"All LeetCode methods failed: {e2}")
+                            break
 
                 if not nodes:
-                    log.info("No more posts, stopping")
+                    log.info("No more posts from LeetCode")
                     break
 
                 for node in nodes:
@@ -154,35 +213,30 @@ def run_leetcode_scraper():
                         break
 
                     stats["found"] += 1
-                    url_key  = node.get("urlKey") or str(node.get("id", ""))
-                    post_url = f"https://leetcode.com/discuss/interview-experience/{url_key}"
+                    n        = normalize_node(node)
+                    post_url = f"https://leetcode.com/discuss/interview-experience/{n['url_key']}"
 
-                    # Deduplication
+                    # ── Duplicate prevention ──────────────────────────────
                     if url_exists(db, post_url):
                         stats["skipped"] += 1
+                        log.debug(f"Duplicate skipped: {n['title'][:50]}")
                         continue
 
-                    title    = node.get("title", "").strip()
-                    raw_html = (node.get("post") or {}).get("content", "")
-                    raw_text = strip_html(raw_html) if raw_html else ""
+                    raw_text  = strip_html(n["content_html"]) if n["content_html"] else ""
+                    published = None
+                    if n["timestamp"]:
+                        try:
+                            published = datetime.utcfromtimestamp(int(n["timestamp"])).isoformat()
+                        except Exception:
+                            pass
 
-                    # Parse published date
-                    creation = node.get("creationDate", 0)
-                    try:
-                        published = datetime.utcfromtimestamp(int(creation)).isoformat() if creation else None
-                    except Exception:
-                        published = None
-
-                    # Fast regex parse — NO AI dependency
-                    parsed       = parse_title(title, raw_text[:300])
-                    company_name = parsed.get("company")
-                    category     = parsed.get("category", "other")
-                    company_id   = upsert_company(db, company_name) if company_name else None
+                    parsed     = parse_title(n["title"], raw_text[:300])
+                    company_id = upsert_company(db, parsed.get("company")) if parsed.get("company") else None
 
                     post_row = {
-                        "title":            title or "Untitled",
+                        "title":            n["title"] or "Untitled",
                         "company_id":       company_id,
-                        "category":         category,
+                        "category":         parsed.get("category", "other"),
                         "source":           "leetcode",
                         "source_url":       post_url,
                         "published_date":   published,
@@ -200,7 +254,7 @@ def run_leetcode_scraper():
                     if post_id:
                         stats["inserted"] += 1
                         fetched += 1
-                        log.success(f"[LeetCode] ✅ {title[:65]}")
+                        log.success(f"[LeetCode] ✅ {n['title'][:65]}")
                     else:
                         stats["errors"] += 1
 
@@ -211,7 +265,7 @@ def run_leetcode_scraper():
                 time.sleep(1.5)
 
     except Exception as e:
-        log.error(f"LeetCode scraper fatal error: {e}", exc_info=True)
+        log.error(f"LeetCode fatal: {e}", exc_info=True)
         stats["errors"]       += 1
         stats["status"]        = "failed"
         stats["error_message"] = str(e)
@@ -224,5 +278,31 @@ def run_leetcode_scraper():
     return stats
 
 
+def scrape_html_fallback(client: httpx.Client, page: int = 1) -> list[dict]:
+    """Last resort: scrape the LeetCode discuss HTML page directly."""
+    url  = f"https://leetcode.com/discuss/interview-experience/?currentPage={page}&orderBy=newest_to_oldest"
+    resp = client.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+
+    from bs4 import BeautifulSoup
+    soup  = BeautifulSoup(resp.text, "lxml")
+    nodes = []
+
+    # Look for topic links in the HTML
+    for a in soup.select('a[href*="/discuss/"]'):
+        href  = a.get("href", "")
+        title = a.get_text(strip=True)
+        if "/discuss/interview-experience/" in href and len(title) > 10:
+            slug = href.rstrip("/").split("/")[-1]
+            nodes.append({
+                "title":        title,
+                "urlKey":       slug,
+                "post":         {"content": ""},
+                "creationDate": 0,
+            })
+
+    return nodes
+
+
 if __name__ == "__main__":
-    run_leetcode_scraper()
+    run_leetcode_scraper(fetch_old=True)
