@@ -3,9 +3,10 @@ nixPkgs = ["python311"]
 
 [phases.install]
 cmds = [
-  "pip install -r requirements.txt",
-  "playwright install chromium --with-deps"
+  "python3.11 -m pip install --upgrade pip",
+  "python3.11 -m pip install -r requirements.txt",
+  "python3.11 -m playwright install chromium --with-deps"
 ]
 
 [start]
-cmd = "python main.py"
+cmd = "python3.11 main.py"
