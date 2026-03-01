@@ -1,6 +1,8 @@
 """
-jobs/scheduler.py - Background job scheduler for Railway deployment
-Runs scrapers on a daily schedule, with immediate first run option
+jobs/scheduler.py
+- On startup: full historical scrape (new + old posts)
+- Every 2 hours: new posts only (fast)
+- Every Sunday: full historical re-scrape
 """
 import schedule
 import time
@@ -8,43 +10,46 @@ import threading
 from datetime import datetime
 
 from utils.logger import log
-from scrapers.reddit_scraper import run_reddit_scraper
-from scrapers.leetcode_scraper import run_leetcode_scraper
 
 
-def run_all_scrapers():
-    """Run all scrapers in sequence."""
-    log.info(f"🚀 Scheduled scrape starting at {datetime.utcnow().isoformat()}")
+def run_all_scrapers(fetch_old: bool = False):
+    log.info(f"🚀 Scrape starting (fetch_old={fetch_old}) at {datetime.utcnow().isoformat()}")
     try:
-        run_leetcode_scraper()
+        from scrapers.leetcode_scraper import run_leetcode_scraper
+        run_leetcode_scraper(fetch_old=fetch_old)
     except Exception as e:
-        log.error(f"LeetCode scraper failed: {e}")
+        log.error(f"LeetCode scraper error: {e}")
     try:
-        run_reddit_scraper()
+        from scrapers.reddit_scraper import run_reddit_scraper
+        run_reddit_scraper(fetch_old=fetch_old)
     except Exception as e:
-        log.error(f"Reddit scraper failed: {e}")
-    log.info("✅ Scheduled scrape complete")
+        log.error(f"Reddit scraper error: {e}")
+    log.info("✅ Scrape complete")
 
 
 def start_scheduler(run_immediately: bool = True):
-    """Start the scheduler. Optionally run once immediately on startup."""
-    log.info("Starting interview scraper scheduler")
+    log.info("Starting scheduler")
 
     if run_immediately:
-        log.info("Running initial scrape immediately...")
-        thread = threading.Thread(target=run_all_scrapers, daemon=True)
+        # First run: fetch everything including historical posts
+        thread = threading.Thread(
+            target=run_all_scrapers,
+            kwargs={"fetch_old": True},
+            daemon=True
+        )
         thread.start()
 
-    # Schedule daily at 06:00 UTC
-    schedule.every().day.at("06:00").do(run_all_scrapers)
-    # Also run every 6 hours for more frequent updates
-    schedule.every(6).hours.do(run_all_scrapers)
+    # Every 2 hours: fetch new posts only (fast)
+    schedule.every(2).hours.do(run_all_scrapers, fetch_old=False)
 
-    log.info("Scheduler running: daily at 06:00 UTC + every 6 hours")
+    # Every Sunday at 03:00 UTC: full historical re-scrape
+    schedule.every().sunday.at("03:00").do(run_all_scrapers, fetch_old=True)
+
+    log.info("Scheduler: new posts every 2h, full history every Sunday")
 
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(30)
 
 
 if __name__ == "__main__":
